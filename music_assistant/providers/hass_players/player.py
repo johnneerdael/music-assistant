@@ -2,59 +2,61 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from hass_client.exceptions import FailedCommand
-from music_assistant_models.enums import PlaybackState, PlayerFeature, PlayerType
+from music_assistant_models.enums import (
+    IdentifierType,
+    ImageType,
+    MediaType,
+    PlaybackState,
+    PlayerFeature,
+)
+from music_assistant_models.media_items import MediaItemImage
 
 from music_assistant.constants import (
-    CONF_ENTRY_ENABLE_ICY_METADATA,
+    ATTR_ANNOUNCEMENT_IN_PROGRESS,
     CONF_ENTRY_ENABLE_ICY_METADATA_HIDDEN,
-    CONF_ENTRY_FLOW_MODE_DEFAULT_ENABLED,
-    CONF_ENTRY_FLOW_MODE_ENFORCED,
-    CONF_ENTRY_HTTP_PROFILE,
     CONF_ENTRY_HTTP_PROFILE_FORCED_2,
     CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
+    EXTERNAL_PAUSE_IDLE_TIMEOUT,
     HIDDEN_ANNOUNCE_VOLUME_CONFIG_ENTRIES,
     create_output_codec_config_entry,
-    create_sample_rates_config_entry,
 )
 from music_assistant.helpers.datetime import from_iso_string
-from music_assistant.helpers.tags import async_parse_tags
-from music_assistant.models.player import DeviceInfo, Player, PlayerMedia
+from music_assistant.models.player import DeviceInfo, Player, PlayerMedia, PlayerSource
 from music_assistant.models.player_provider import PlayerProvider
 from music_assistant.providers.hass.constants import (
     OFF_STATES,
     UNAVAILABLE_STATES,
     MediaPlayerEntityFeature,
     StateMap,
+    parse_supported_features,
 )
 
-from .constants import CONF_ENTRY_WARN_HASS_INTEGRATION, WARN_HASS_INTEGRATIONS
-from .helpers import ESPHomeSupportedAudioFormat
+from .constants import CONF_ENTRY_WARN_HASS_INTEGRATION, NATIVE_SUPPORTED_HASS_INTEGRATIONS
+from .helpers import ESPHomeSupportedAudioFormat, native_player_macs, normalized_mac
 
 if TYPE_CHECKING:
     from hass_client import HomeAssistantClient
     from hass_client.models import CompressedState
     from hass_client.models import Entity as HassEntity
     from hass_client.models import State as HassState
-    from music_assistant_models.config_entries import ConfigEntry, ConfigValueType
+    from music_assistant_models.config_entries import ConfigEntry
+
+    from .provider import HomeAssistantPlayerProvider
 
 
-DEFAULT_PLAYER_CONFIG_ENTRIES = (
-    CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,
-    CONF_ENTRY_HTTP_PROFILE,
-    CONF_ENTRY_ENABLE_ICY_METADATA,
-    CONF_ENTRY_FLOW_MODE_ENFORCED,
-)
+DEFAULT_PLAYER_CONFIG_ENTRIES = (CONF_ENTRY_OUTPUT_CODEC_DEFAULT_MP3,)
 
 
 class HomeAssistantPlayer(Player):
     """Home Assistant Player implementation."""
 
-    _attr_type = PlayerType.PLAYER
+    # the wrapped entity keeps reporting an abandoned external session as paused, and
+    # Home Assistant pushes no event when it goes stale.
+    _attr_external_pause_idle_timeout = EXTERNAL_PAUSE_IDLE_TIMEOUT
 
     def __init__(
         self,
@@ -73,15 +75,19 @@ class HomeAssistantPlayer(Player):
         self._extra_data = extra_player_data
         # Set base attributes from Home Assistant state
         self._attr_available = hass_state["state"] not in UNAVAILABLE_STATES
-        self._attr_device_info = DeviceInfo.from_dict(dev_info)
+        self._attr_device_info = DeviceInfo(
+            model=dev_info.get("model", ""),
+            manufacturer=dev_info.get("manufacturer", ""),
+            software_version=dev_info.get("software_version"),
+        )
+        if mac_address := dev_info.get("mac_address"):
+            self._attr_device_info.add_identifier(IdentifierType.MAC_ADDRESS, mac_address)
         self._attr_playback_state = StateMap.get(hass_state["state"], PlaybackState.IDLE)
         # Work out supported features
-        self._attr_supported_features = set()
-        hass_supported_features = MediaPlayerEntityFeature(
-            hass_state["attributes"]["supported_features"]
+        self._attr_supported_features = {PlayerFeature.PLAY_MEDIA}
+        hass_supported_features = parse_supported_features(
+            hass_state["attributes"].get("supported_features"), player_id, self.logger
         )
-        if MediaPlayerEntityFeature.PAUSE in hass_supported_features:
-            self._attr_supported_features.add(PlayerFeature.PAUSE)
         if MediaPlayerEntityFeature.VOLUME_SET in hass_supported_features:
             self._attr_supported_features.add(PlayerFeature.VOLUME_SET)
         if MediaPlayerEntityFeature.VOLUME_MUTE in hass_supported_features:
@@ -104,44 +110,62 @@ class HomeAssistantPlayer(Player):
             self._attr_powered = hass_state["state"] not in OFF_STATES
 
         self.extra_data["hass_supported_features"] = hass_supported_features
+        self._hass_attributes: dict[str, Any] = {}
+        self._ma_playback_active = False
+        self._ma_playback_started = False
+        self._reports_stream_url = False
+
+        # Add External source to support next/prev commands when playing external content
+        self._attr_source_list.append(
+            PlayerSource(
+                id="External",
+                name="External Source",
+                passive=True,
+            )
+        )
+        # Set dynamic features (PAUSE, NEXT_PREVIOUS, SEEK) via shared helper
+        self._update_hass_features(hass_supported_features)
+
+        # Derive supported sample rates from ESPHome's reported formats when available
+        esphome_formats: list[ESPHomeSupportedAudioFormat] | None = self.extra_data.get(
+            "esphome_supported_audio_formats"
+        )
+        if esphome_formats:
+            rates = sorted(
+                {(fmt["sample_rate"], (fmt["sample_bytes"] or 2) * 8) for fmt in esphome_formats}
+            )
+            self._attr_supported_sample_rates = rates or [(48000, 16)]
+
         self._update_attributes(hass_state["attributes"])
 
-    async def get_config_entries(
-        self,
-        action: str | None = None,
-        values: dict[str, ConfigValueType] | None = None,
-    ) -> list[ConfigEntry]:
+    @property
+    def requires_flow_mode(self) -> bool:
+        """Return if the player requires flow mode."""
+        # hass media players are a hot mess so play it safe and always use flow mode
+        return True
+
+    async def get_config_entries(self) -> list[ConfigEntry]:
         """Return all (provider/player specific) Config Entries for the player."""
-        base_entries = await super().get_config_entries(action=action, values=values)
-        base_entries = [*base_entries, *DEFAULT_PLAYER_CONFIG_ENTRIES]
-        if self.extra_data.get("esphome_supported_audio_formats"):
+        base_entries = [*DEFAULT_PLAYER_CONFIG_ENTRIES]
+        # add alert if the player (type) is also supported by a native MA provider
+        if (
+            self.extra_data.get("hass_domain") in NATIVE_SUPPORTED_HASS_INTEGRATIONS
+            or self._has_native_duplicate()
+        ):
+            base_entries = [CONF_ENTRY_WARN_HASS_INTEGRATION, *base_entries]
+        supported_formats: list[ESPHomeSupportedAudioFormat] | None = self.extra_data.get(
+            "esphome_supported_audio_formats"
+        )
+        if supported_formats:
             # optimized config for new ESPHome mediaplayer
-            supported_sample_rates: list[int] = []
-            supported_bit_depths: list[int] = []
-            codec: str | None = None
-            supported_formats: list[ESPHomeSupportedAudioFormat] = self.extra_data[
-                "esphome_supported_audio_formats"
-            ]
             # sort on purpose field, so we prefer the media pipeline
             # but allows fallback to announcements pipeline if no media pipeline is available
             supported_formats.sort(key=lambda x: x["purpose"])
-            for supported_format in supported_formats:
-                codec = supported_format["format"]
-                if supported_format["sample_rate"] not in supported_sample_rates:
-                    supported_sample_rates.append(supported_format["sample_rate"])
-                bit_depth = (supported_format["sample_bytes"] or 2) * 8
-                if bit_depth not in supported_bit_depths:
-                    supported_bit_depths.append(bit_depth)
-            if not supported_sample_rates or not supported_bit_depths:
-                # esphome device with no media pipeline configured
-                # simply use the default config of the media pipeline
-                supported_sample_rates = [48000]
-                supported_bit_depths = [16]
+            codec = supported_formats[0]["format"] if supported_formats else None
 
             config_entries = [
                 *base_entries,
                 # New ESPHome mediaplayer (used in Voice PE) uses FLAC 48khz/16 bits
-                CONF_ENTRY_FLOW_MODE_ENFORCED,
                 CONF_ENTRY_HTTP_PROFILE_FORCED_2,
             ]
 
@@ -151,11 +175,6 @@ class HomeAssistantPlayer(Player):
             config_entries.extend(
                 [
                     CONF_ENTRY_ENABLE_ICY_METADATA_HIDDEN,
-                    create_sample_rates_config_entry(
-                        supported_sample_rates=supported_sample_rates,
-                        supported_bit_depths=supported_bit_depths,
-                        hidden=True,
-                    ),
                     # although the Voice PE supports announcements,
                     # it does not support volume for announcements
                     *HIDDEN_ANNOUNCE_VOLUME_CONFIG_ENTRIES,
@@ -163,14 +182,6 @@ class HomeAssistantPlayer(Player):
             )
 
             return config_entries
-
-        # add alert if player is a known player type that has a native provider in MA
-        if self.extra_data.get("hass_domain") in WARN_HASS_INTEGRATIONS:
-            base_entries = [CONF_ENTRY_WARN_HASS_INTEGRATION, *base_entries]
-
-        # enable flow mode by default if player does not report enqueue support
-        if MediaPlayerEntityFeature.MEDIA_ENQUEUE not in self.extra_data["hass_supported_features"]:
-            base_entries = [*base_entries, CONF_ENTRY_FLOW_MODE_DEFAULT_ENABLED]
 
         return base_entries
 
@@ -205,6 +216,8 @@ class HomeAssistantPlayer(Player):
             if PlayerFeature.PAUSE in self.supported_features:
                 await self.pause()
         finally:
+            self._ma_playback_active = False
+            self._ma_playback_started = False
             self._attr_current_media = None
             self.update_state()
 
@@ -234,8 +247,25 @@ class HomeAssistantPlayer(Player):
             target={"entity_id": self.player_id},
         )
 
+    async def next_track(self) -> None:
+        """Handle NEXT_TRACK command on the player."""
+        await self.hass.call_service(
+            domain="media_player",
+            service="media_next_track",
+            target={"entity_id": self.player_id},
+        )
+
+    async def previous_track(self) -> None:
+        """Handle PREVIOUS_TRACK command on the player."""
+        await self.hass.call_service(
+            domain="media_player",
+            service="media_previous_track",
+            target={"entity_id": self.player_id},
+        )
+
     async def play_media(self, media: PlayerMedia) -> None:
         """Handle PLAY MEDIA on given player."""
+        url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
         extra_data: dict[str, Any] = {
             # passing metadata to the player
             # so far only supported by google cast, but maybe others can follow
@@ -247,7 +277,7 @@ class HomeAssistantPlayer(Player):
                 "albumName": media.album,
                 "images": [{"url": media.image_url}] if media.image_url else None,
                 "imageUrl": media.image_url,
-                "duration": media.duration,
+                "duration": media.stream_duration or media.duration,
             },
         }
         if self.extra_data.get("hass_domain") == "esphome":
@@ -256,7 +286,7 @@ class HomeAssistantPlayer(Player):
             extra_data["bypass_proxy"] = True
 
         # stop the player if it is already playing
-        if self.playback_state == PlaybackState.PLAYING:
+        if self._attr_playback_state == PlaybackState.PLAYING:
             await self.stop()
 
         await self.hass.call_service(
@@ -264,7 +294,7 @@ class HomeAssistantPlayer(Player):
             service="play_media",
             target={"entity_id": self.player_id},
             service_data={
-                "media_content_id": media.uri,
+                "media_content_id": url,
                 "media_content_type": "music",
                 "enqueue": "replace",
                 "extra": extra_data,
@@ -272,6 +302,13 @@ class HomeAssistantPlayer(Player):
         )
 
         # Optimistically update state
+        self._ma_playback_active = True
+        # the entity may still be reporting the previous session, so our stream only
+        # counts as started once it is seen playing
+        self._ma_playback_started = False
+        # a source the entity played before is over, and it may never report an
+        # attribute change to tell us so
+        self._attr_active_source = None
         self._attr_current_media = media
         self._attr_elapsed_time = 0
         self._attr_elapsed_time_last_updated = time.time()
@@ -292,21 +329,8 @@ class HomeAssistantPlayer(Player):
                 "Announcement volume level is not supported for player %s",
                 self.display_name,
             )
-        await self.hass.call_service(
-            domain="media_player",
-            service="play_media",
-            service_data={
-                "media_content_id": announcement.uri,
-                "media_content_type": "music",
-                "announce": True,
-            },
-            target={"entity_id": self.player_id},
-        )
-        # Wait until the announcement is finished playing
-        # This is helpful for people who want to play announcements in a sequence
-        media_info = await async_parse_tags(announcement.uri, require_duration=True)
-        duration = media_info.duration or 5
-        await asyncio.sleep(duration)
+        hass_prov = cast("HomeAssistantPlayerProvider", self.provider).hass_prov
+        await hass_prov.play_announcement_on_entity(self.player_id, announcement)
         self.logger.debug(
             "Playing announcement on %s completed",
             self.display_name,
@@ -347,12 +371,40 @@ class HomeAssistantPlayer(Player):
             self._attr_available = state["s"] not in UNAVAILABLE_STATES
             if PlayerFeature.POWER in self.supported_features:
                 self._attr_powered = state["s"] not in OFF_STATES
+            self._track_ma_playback(state["s"])
         if "a" in state:
             self._update_attributes(state["a"])
         self.update_state()
 
+    def _update_hass_features(self, hass_supported_features: MediaPlayerEntityFeature) -> None:
+        """Update player and External source features based on HA supported features."""
+        # Update player supported features for PAUSE and NEXT_PREVIOUS
+        if MediaPlayerEntityFeature.PAUSE in hass_supported_features:
+            self._attr_supported_features.add(PlayerFeature.PAUSE)
+        else:
+            self._attr_supported_features.discard(PlayerFeature.PAUSE)
+
+        has_next_prev = (
+            MediaPlayerEntityFeature.NEXT_TRACK in hass_supported_features
+            or MediaPlayerEntityFeature.PREVIOUS_TRACK in hass_supported_features
+        )
+        if has_next_prev:
+            self._attr_supported_features.add(PlayerFeature.NEXT_PREVIOUS)
+        else:
+            self._attr_supported_features.discard(PlayerFeature.NEXT_PREVIOUS)
+
+        # Update the External source capabilities
+        for source in self._attr_source_list:
+            if source.id == "External":
+                source.can_play_pause = MediaPlayerEntityFeature.PAUSE in hass_supported_features
+                source.can_next_previous = has_next_prev
+                source.can_seek = MediaPlayerEntityFeature.SEEK in hass_supported_features
+                break
+
     def _update_attributes(self, attributes: dict[str, Any]) -> None:
         """Update Player attributes from HA state attributes."""
+        self._hass_attributes.update(attributes)
+
         # process optional attributes - these may not be present in all states
         for key, value in attributes.items():
             if key == "friendly_name":
@@ -385,3 +437,108 @@ class HomeAssistantPlayer(Player):
                     self._attr_group_members.clear()
                 else:
                     self._attr_group_members.clear()
+            elif key == "supported_features":
+                # Update supported features dynamically via shared helper
+                hass_supported_features = parse_supported_features(
+                    value, self.player_id, self.logger
+                )
+                self.extra_data["hass_supported_features"] = hass_supported_features
+                self._update_hass_features(hass_supported_features)
+
+        if self.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
+            # the media attributes describe the announcement instead of the source that
+            # is restored afterwards, so they tell us nothing about who owns playback.
+            # Drop the announcement's id so a later partial update can not judge by it.
+            self._hass_attributes.pop("media_content_id", None)
+            return
+
+        # Check for external playback (not from Music Assistant).
+        # Not every integration echoes the stream URL we handed it back in
+        # media_content_id; some report device or cloud provided metadata instead. Only
+        # entities that were seen echoing it can be judged by it - for the others the
+        # play command we issued is what tells the two sources apart. Without either
+        # signal the source stays as it was.
+        media_content_id = self._hass_attributes.get("media_content_id", "")
+        if media_content_id.startswith(self.mass.streams.base_url):
+            self._reports_stream_url = True
+            is_ma_playback = True
+        else:
+            is_ma_playback = not self._reports_stream_url and self._ma_playback_active
+        media_title = self._hass_attributes.get("media_title")
+
+        if is_ma_playback:
+            # MA playback - the queue controller resolves the active source and
+            # provides the actual current_media.
+            self._attr_active_source = None
+        elif (
+            media_content_id
+            and media_title
+            and self.playback_state in (PlaybackState.PLAYING, PlaybackState.PAUSED)
+        ):
+            # External playback detected - set current_media from HA attributes
+            ha_content_type = self._hass_attributes.get("media_content_type", "")
+            media_type = MediaType.RADIO if ha_content_type == "radio" else MediaType.UNKNOWN
+            current_media = PlayerMedia(
+                uri=media_content_id,
+                media_type=media_type,
+                title=media_title,
+                artist=self._hass_attributes.get("media_artist"),
+                album=self._hass_attributes.get("media_album_name"),
+                image_url=self._get_image_url(self._hass_attributes),
+                duration=int(self._hass_attributes.get("media_duration", 0) or 0) or None,
+            )
+            self._attr_current_media = current_media
+            self._attr_active_source = "External"
+
+        elif self.playback_state == PlaybackState.IDLE:
+            # Clear external media if it was set
+            if self._attr_active_source and self._attr_active_source not in (
+                self.player_id,
+                None,
+            ):
+                self._attr_current_media = None
+                self._attr_active_source = None
+
+    def _track_ma_playback(self, hass_state: str) -> None:
+        """
+        Follow the entity's state to tell whether the stream MA handed it is still playing.
+
+        :param hass_state: The raw state as reported by the entity.
+        """
+        if self.extra_data.get(ATTR_ANNOUNCEMENT_IN_PROGRESS):
+            # an announcement takes the entity over, its states say nothing about our stream
+            return
+        if self._attr_playback_state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
+            self._ma_playback_started = True
+        elif hass_state not in UNAVAILABLE_STATES and self._ma_playback_started:
+            # the entity played our stream and stopped again, so the session ended with it
+            self._ma_playback_active = False
+            self._ma_playback_started = False
+
+    def _get_image_url(self, attributes: dict[str, Any]) -> str | None:
+        """Get the image URL from the attributes."""
+        if entity_picture := attributes.get("entity_picture"):
+            entity_picture = str(entity_picture)
+            if entity_picture.startswith("http"):
+                return entity_picture
+
+            # Access via provider -> hass_prov
+            prov = cast("HomeAssistantPlayerProvider", self.provider)
+
+            # Use proxy for internal HA images
+            # We create a MediaItemImage with the hass provider as source
+            # This will trigger resolve_image on the hass provider when requested
+            image = MediaItemImage(
+                type=ImageType.THUMB,
+                path=entity_picture,
+                provider=prov.hass_prov.instance_id,
+                remotely_accessible=False,
+            )
+            return self.mass.metadata.get_image_url(image)
+        return None
+
+    def _has_native_duplicate(self) -> bool:
+        """Whether this device is also registered as a native Music Assistant player."""
+        if not (mac := self.device_info.identifiers.get(IdentifierType.MAC_ADDRESS)):
+            return False
+        return normalized_mac(mac) in native_player_macs(self.mass)

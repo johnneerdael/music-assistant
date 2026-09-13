@@ -7,117 +7,158 @@
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from typing import TYPE_CHECKING, ClassVar, Final
 
+import aiohttp
+import requests.exceptions
 from liblistenbrainz import Listen, ListenBrainz
-from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
+from liblistenbrainz.errors import ListenBrainzException
 from music_assistant_models.constants import SECURE_STRING_SUBSTITUTE
-from music_assistant_models.enums import ConfigEntryType, EventType, ProviderFeature
-from music_assistant_models.errors import SetupFailedError
-from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
-from music_assistant_models.provider import ProviderManifest
+from music_assistant_models.enums import MediaType, ProviderFeature
+from music_assistant_models.errors import InvalidToken, SetupFailedError
 
-from music_assistant.helpers.scrobbler import (
-    ScrobblerConfig,
-    ScrobblerHelper,
-    create_scrobble_users_config_entry,
-)
+from music_assistant.constants import UNKNOWN_ARTIST
+from music_assistant.helpers.scrobbler import ScrobblerConfig, ScrobblerHelper
 from music_assistant.mass import MusicAssistant
 from music_assistant.models import ProviderInstanceType
 from music_assistant.models.plugin import PluginProvider
 
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.playback_progress_report import MediaItemPlaybackProgressReport
+    from music_assistant_models.provider import ProviderManifest
+
 CONF_USER_TOKEN = "_user_token"
-SUPPORTED_FEATURES: set[ProviderFeature] = (
-    set()
-)  # we don't have any special supported features (yet)
+CONF_API_BASE_URL = "api_base_url"
+LISTENBRAINZ_API_URL = "https://api.listenbrainz.org"
+SUPPORTED_FEATURES: set[ProviderFeature] = {ProviderFeature.SCROBBLE}
+SUPPORTED_SCROBBLE_MEDIA_TYPES: Final[frozenset[MediaType]] = frozenset({MediaType.TRACK})
 
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     """Initialize provider(instance) with given configuration."""
-    token = config.get_value(CONF_USER_TOKEN)
-    if not token:
-        raise SetupFailedError("User token needs to be set")
-
-    assert token != SECURE_STRING_SUBSTITUTE
-
-    client = ListenBrainz()
-    client.set_auth_token(token)
-
-    return ListenBrainzScrobbleProvider(mass, manifest, config, client)
+    return ListenBrainzScrobbleProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
 class ListenBrainzScrobbleProvider(PluginProvider):
     """Plugin provider to support scrobbling of tracks."""
 
-    def __init__(
-        self,
-        mass: MusicAssistant,
-        manifest: ProviderManifest,
-        config: ProviderConfig,
-        client: ListenBrainz,
-    ) -> None:
-        """Initialize MusicProvider."""
-        super().__init__(mass, manifest, config, SUPPORTED_FEATURES)
+    _client: ListenBrainz
+    _handler: ListenBrainzEventHandler | None = None
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return tuple(await ScrobblerConfig.get_shared_config_entries(self.mass, None))
+
+    async def handle_async_init(self) -> None:
+        """Create the ListenBrainz client from the configured user token."""
+        token = self.get_setup_value(CONF_USER_TOKEN)
+        api_base_url = self.get_setup_value(CONF_API_BASE_URL) or LISTENBRAINZ_API_URL
+        if not token:
+            raise SetupFailedError("User token needs to be set")
+        assert token != SECURE_STRING_SUBSTITUTE
+        await self._validate_token(str(api_base_url), str(token))
+        client = ListenBrainz(api_base_url=str(api_base_url))
+        # the token is validated above, so skip the client's own blocking check
+        client.set_auth_token(str(token), check_validity=False)
         self._client = client
-        self._on_unload: list[Callable[[], None]] = []
 
     async def loaded_in_mass(self) -> None:
         """Call after the provider has been loaded."""
         await super().loaded_in_mass()
 
-        handler = ListenBrainzEventHandler(self._client, self.logger, self.config)
+        self._handler = ListenBrainzEventHandler(self._client, self.logger, self.config)
 
-        # subscribe to media_item_played event
-        self._on_unload.append(
-            self.mass.subscribe(handler._on_mass_media_item_played, EventType.MEDIA_ITEM_PLAYED)
-        )
+    async def on_media_item_played(self, report: MediaItemPlaybackProgressReport) -> None:
+        """Forward a playback progress report to ListenBrainz."""
+        if self._handler is not None:
+            await self._handler.on_media_item_played(report)
 
-    async def unload(self, is_removed: bool = False) -> None:
+    async def _validate_token(self, api_base_url: str, token: str) -> None:
         """
-        Handle unload/close of the provider.
+        Check the configured user token against ListenBrainz.
 
-        Called when provider is deregistered (e.g. MA exiting or config reloading).
+        :param api_base_url: Base URL of the ListenBrainz API.
+        :param token: The user token to validate.
         """
-        for unload_cb in self._on_unload:
-            unload_cb()
+        url = f"{api_base_url.rstrip('/')}/1/validate-token"
+        try:
+            async with self.mass.http_session.get(
+                url,
+                headers={"Authorization": f"Token {token}"},
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as response:
+                response.raise_for_status()
+                result = await response.json()
+        except (aiohttp.ClientError, TimeoutError, ValueError) as err:
+            # ValueError covers a malformed JSON body from response.json()
+            raise SetupFailedError(f"Unable to connect to ListenBrainz: {err}") from err
+        # only an explicit boolean valid=false proves the token is bad; any other
+        # shape is a response we can't trust, so keep setup retryable
+        valid = result.get("valid") if isinstance(result, dict) else None
+        if not isinstance(valid, bool):
+            raise SetupFailedError("Unexpected response from ListenBrainz")
+        if not valid:
+            raise InvalidToken("Invalid ListenBrainz user token")
 
 
 class ListenBrainzEventHandler(ScrobblerHelper):
-    """Handles the event handling."""
+    """Submit now-playing updates and listens to ListenBrainz."""
+
+    # The client raises ListenBrainzException for API/payload errors and lets raw
+    # requests network errors (RequestException) propagate.
+    scrobble_exceptions: ClassVar[tuple[type[Exception], ...]] = (
+        ListenBrainzException,
+        requests.exceptions.RequestException,
+    )
 
     def __init__(
         self, client: ListenBrainz, logger: logging.Logger, config: ProviderConfig
     ) -> None:
         """Initialize."""
-        super().__init__(logger, ScrobblerConfig.create_from_config(config))
+        super().__init__(
+            logger,
+            ScrobblerConfig.create_from_config(config),
+            SUPPORTED_SCROBBLE_MEDIA_TYPES,
+        )
         self._client = client
+
+    def _get_artist_name(self, report: MediaItemPlaybackProgressReport) -> str:
+        """Return the best available artist name for the ListenBrainz payload."""
+        if report.artists:
+            return ", ".join(artist for artist in report.artists)
+        return report.artist or UNKNOWN_ARTIST
 
     def _make_listen(self, report: MediaItemPlaybackProgressReport) -> Listen:
         # album artist and track number are not available without an extra API call
         # so they won't be scrobbled
 
+        additional_info = {}
+
+        if report.duration:
+            additional_info["duration"] = report.duration
+
+        if report.seconds_played:
+            additional_info["duration_played"] = report.seconds_played
+
         # https://pylistenbrainz.readthedocs.io/en/latest/api_ref.html#class-listen
         return Listen(
             track_name=self.get_name(report),
-            artist_name=report.artist,
+            artist_name=self._get_artist_name(report),
             artist_mbids=report.artist_mbids,
             release_name=report.album,
             release_mbid=report.album_mbid,
             recording_mbid=report.mbid,
             listening_from="music-assistant",
+            additional_info=additional_info or None,
         )
 
     async def _update_now_playing(self, report: MediaItemPlaybackProgressReport) -> None:
         def handler() -> None:
-            try:
-                listen = self._make_listen(report)
-                self._client.submit_playing_now(listen)
-                self.logger.debug(f"track {report.uri} marked as 'now playing'")
-                self._currently_playing = report.uri
-            except Exception as err:
-                self.logger.exception(err)
+            listen = self._make_listen(report)
+            self._client.submit_playing_now(listen)
 
         # the listenbrainz client is not async friendly,
         # so we need to run it in a executor thread
@@ -125,35 +166,10 @@ class ListenBrainzEventHandler(ScrobblerHelper):
 
     async def _scrobble(self, report: MediaItemPlaybackProgressReport) -> None:
         def handler() -> None:
-            try:
-                listen = self._make_listen(report)
-                listen.listened_at = int(time.time())
-                self._client.submit_single_listen(listen)
-                self._last_scrobbled = report.uri
-            except Exception as err:
-                self.logger.exception(err)
+            listen = self._make_listen(report)
+            listen.listened_at = int(time.time())
+            self._client.submit_single_listen(listen)
 
         # the listenbrainz client is not async friendly,
         # so we need to run it in a executor thread
         await asyncio.to_thread(handler)
-
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,  # noqa: ARG001
-    action: str | None = None,  # noqa: ARG001
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """Return Config entries to setup this provider."""
-    return (
-        *ScrobblerConfig.get_shared_config_entries(values),
-        ConfigEntry(
-            key=CONF_USER_TOKEN,
-            type=ConfigEntryType.SECURE_STRING,
-            label="User Token",
-            required=True,
-            value=values.get(CONF_USER_TOKEN) if values else None,
-        ),
-        # add user selection entry
-        await create_scrobble_users_config_entry(mass),
-    )

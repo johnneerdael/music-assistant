@@ -2,14 +2,55 @@
 
 import asyncio
 import contextlib
+import inspect
+import logging
 import pathlib
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterator, Mapping
+from types import MethodType
+from typing import TYPE_CHECKING, Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import aiofiles.os
-from music_assistant_models.enums import EventType
-from music_assistant_models.event import MassEvent
+from music_assistant_models.enums import (
+    EventType,
+    IdentifierType,
+    PlayerFeature,
+    PlayerType,
+    ProviderType,
+)
+from music_assistant_models.player import DeviceInfo
 
+from music_assistant.constants import CONF_PROVIDERS
+from music_assistant.controllers.config import ConfigController
+from music_assistant.controllers.tasks.constants import TASK_LIFECYCLE_UPDATE_DEBOUNCE
 from music_assistant.mass import MusicAssistant
+from music_assistant.models.player import Player
+
+if TYPE_CHECKING:
+    from music_assistant_models.config_entries import ProviderAccess
+    from music_assistant_models.event import MassEvent
+
+
+def utf8_safe(value: object) -> object:
+    """
+    Return ``value`` with any non-UTF-8-encodable strings made encodable.
+
+    Lone surrogates (e.g. from undecodable filesystem paths) are replaced with
+    their backslash escapes so the value survives strict-UTF-8 serialization.
+    """
+    if isinstance(value, str):
+        try:
+            value.encode()
+        except UnicodeEncodeError:
+            return value.encode("utf-8", "backslashreplace").decode()
+        return value
+    if isinstance(value, list):
+        return [utf8_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(utf8_safe(item) for item in value)
+    if isinstance(value, dict):
+        return {utf8_safe(key): utf8_safe(item) for key, item in value.items()}
+    return value
 
 
 def _get_fixture_folder(provider: str | None = None) -> pathlib.Path:
@@ -21,7 +62,7 @@ def _get_fixture_folder(provider: str | None = None) -> pathlib.Path:
 
 async def get_fixtures_dir(
     subdir: str, provider: str | None = None
-) -> AsyncGenerator[tuple[str, bytes], None]:
+) -> AsyncGenerator[tuple[str, bytes]]:
     """Yield the contents of every fixture in a fixtures folder."""
     dir_path = _get_fixture_folder(provider) / subdir
     for file in await aiofiles.os.listdir(dir_path):
@@ -29,19 +70,293 @@ async def get_fixtures_dir(
             yield (file, await fp.read())
 
 
+@contextlib.contextmanager
+def collect_loop_errors() -> Iterator[list[dict[str, Any]]]:
+    """
+    Capture everything the running loop reports to its exception handler.
+
+    Yields the (initially empty) list the captured contexts are appended to; the loop's
+    own handler is restored on exit. Use it to assert that an operation does not surface
+    an error the server itself already handles, which would otherwise reach the user as
+    an ERROR log entry with a traceback.
+    """
+    loop = asyncio.get_running_loop()
+    previous = loop.get_exception_handler()
+    reported: list[dict[str, Any]] = []
+    loop.set_exception_handler(lambda _loop, context: reported.append(context))
+    try:
+        yield reported
+    finally:
+        loop.set_exception_handler(previous)
+
+
 @contextlib.asynccontextmanager
-async def wait_for_sync_completion(mass: MusicAssistant) -> AsyncGenerator[None, None]:
+async def wait_for_sync_completion(mass: MusicAssistant) -> AsyncGenerator[None]:
     """Wait for a sync to finish."""
     flag = asyncio.Event()
 
-    def _event(event: MassEvent) -> None:
-        if not event.data:
-            flag.set()
+    def _event(_event: MassEvent) -> None:
+        flag.set()
 
-    release_cb = mass.subscribe(_event, EventType.SYNC_TASKS_UPDATED)
+    release_cb = mass.subscribe(_event, EventType.MUSIC_SYNC_COMPLETED)
 
     try:
         yield
     finally:
-        await flag.wait()
-        release_cb()
+        try:
+            if mass.music.active_sync_tasks:
+                await flag.wait()
+        finally:
+            release_cb()
+
+
+# the address a fixture's web and stream servers bind to, so a test run never listens
+# on the host's real interfaces
+LOOPBACK_IP = "127.0.0.1"
+
+
+@contextlib.contextmanager
+def use_ephemeral_server_ports() -> Iterator[None]:
+    """
+    Bind a full-server test fixture's web and stream servers to a free loopback port.
+
+    Port 0 has the kernel pick the port during the bind itself, so nothing else can
+    claim it in the meantime.
+
+    Binding loopback keeps a test run off the host's other interfaces and gives each
+    server a single socket, so it has one assigned port: asyncio binds a wildcard
+    address once per address family, each with its own port.
+    """
+    with (
+        patch("music_assistant.controllers.webserver.controller.DEFAULT_SERVER_PORT", 0),
+        patch("music_assistant.controllers.streams.controller.DEFAULT_PORT", 0),
+        patch("music_assistant.controllers.webserver.controller.DEFAULT_HOST", LOOPBACK_IP),
+        patch("music_assistant.controllers.streams.controller.DEFAULT_HOST", LOOPBACK_IP),
+        # keep address detection off the host's real interfaces
+        patch(
+            "music_assistant.controllers.streams.controller.get_ip_addresses",
+            AsyncMock(return_value=(LOOPBACK_IP,)),
+        ),
+        patch(
+            "music_assistant.controllers.streams.controller.get_publish_ip_candidates",
+            AsyncMock(return_value=(LOOPBACK_IP,)),
+        ),
+        patch(
+            "music_assistant.controllers.webserver.controller.get_ip_addresses",
+            AsyncMock(return_value=(LOOPBACK_IP,)),
+        ),
+        patch(
+            "music_assistant.controllers.webserver.controller.get_publish_ip_candidates",
+            AsyncMock(return_value=(LOOPBACK_IP,)),
+        ),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def suppress_auto_loaded_providers() -> Iterator[None]:
+    """
+    Stop a fixture boot from auto-setting-up providers that reach into the host.
+
+    Keeps a booted test instance isolated from the developer's machine: the default
+    device providers (airplay/chromecast/dlna/...) are not auto-configured.
+    """
+    with patch("music_assistant.mass.DEFAULT_PROVIDERS", ()):
+        yield
+
+
+async def wait_for_boot_to_settle(mass: MusicAssistant) -> None:
+    """
+    Wait out the events a fixture boot leaves in flight.
+
+    A provider finishes loading in a detached task that registers background tasks, and
+    registering one emits a debounced task list, so without this a test can start watching
+    for events in time to catch the tail of its own fixture's boot.
+
+    :param mass: The started instance to settle.
+    """
+    for provider in mass.providers:
+        await provider.initialized.wait()
+    # twice the window: the debounce a registration already armed, plus the tail of the
+    # post-load work that runs after a provider marks itself initialized
+    await asyncio.sleep(TASK_LIFECYCLE_UPDATE_DEBOUNCE * 2)
+
+
+@contextlib.contextmanager
+def suppress_initial_library_sync() -> Iterator[None]:
+    """
+    Hold a fixture boot's music providers to their recurring library sync only.
+
+    The first sync of a freshly loaded provider otherwise runs seconds into the boot, so on
+    a loaded machine it lands in the middle of whatever test is running by then, rewriting
+    the library under it. Tests that want a sync call ``start_sync()`` themselves.
+    """
+    with patch("music_assistant.controllers.music.controller.INITIAL_SYNC_DELAY", None):
+        yield
+
+
+# Mock classes for testing
+
+
+def use_real_create_task(mass: MagicMock | MusicAssistant) -> None:
+    """
+    Give a mocked MusicAssistant the real create_task implementation.
+
+    Needed for any test that lets a `@use_cache` decorated method run, since the
+    decorator awaits the task it gets back to share one fetch between callers.
+
+    :param mass: The mock standing in for the MusicAssistant instance.
+    """
+    mass._tracked_tasks = {}
+    # on an AsyncMock this call would hand back a coroutine that nobody awaits
+    mass.verify_event_loop_thread = MagicMock()  # type: ignore[method-assign]
+    real_create_task = MethodType(MusicAssistant.create_task, mass)
+
+    def _create_task(target: Any, *args: Any, **kwargs: Any) -> Any:
+        if not (inspect.iscoroutine(target) or inspect.iscoroutinefunction(target)):
+            # tests hand this mocked methods too, which the real one refuses
+            return MagicMock()
+        # resolved per call so this also works from a synchronous fixture
+        mass.loop = asyncio.get_running_loop()
+        return real_create_task(target, *args, **kwargs)
+
+    # kept a mock so tests can still assert on the calls it received
+    mass.create_task = MagicMock(side_effect=_create_task)  # type: ignore[method-assign]
+
+
+def set_music_source_access(
+    mass: MusicAssistant | MagicMock,
+    access_by_instance: Mapping[str, ProviderAccess | None],
+) -> None:
+    """
+    Give the server the given music sources, each carrying the given access record.
+
+    A user's set of music sources is derived from the access records on the raw provider
+    configs, so this is all a test needs to make a source visible to (or hidden from) a
+    user. Works both on a real server and on a mocked one.
+
+    :param mass: The (real or mocked) MusicAssistant instance.
+    :param access_by_instance: Access record per music source instance id; None means a
+        household source, visible to everyone.
+    """
+    raw_configs = {
+        instance_id: {
+            "type": ProviderType.MUSIC.value,
+            "domain": instance_id.split("--")[0],
+            "instance_id": instance_id,
+            "access": access.to_dict() if access else None,
+        }
+        for instance_id, access in access_by_instance.items()
+    }
+    if isinstance(mass.config, ConfigController):
+        for instance_id, raw_config in raw_configs.items():
+            mass.config.set(f"{CONF_PROVIDERS}/{instance_id}", raw_config)
+        return
+    mass.config.get = MagicMock(
+        side_effect=lambda key, default=None: (
+            raw_configs
+            if key == CONF_PROVIDERS
+            else raw_configs.get(key.removeprefix(f"{CONF_PROVIDERS}/"), default)
+        )
+    )
+
+
+def create_mock_config(name: str) -> MagicMock:
+    """Create a mock player config with the given name."""
+    config = MagicMock()
+    config.name = None  # No custom name, use default
+    config.default_name = name
+    config.get_value = MagicMock(return_value="none")  # Default to no power control
+    return config
+
+
+class MockProvider:
+    """Mock player provider for testing."""
+
+    def __init__(
+        self, domain: str, instance_id: str = "test_instance", mass: MagicMock | None = None
+    ) -> None:
+        """Initialize the mock provider."""
+        self.domain = domain
+        self.instance_id = instance_id
+        self.name = f"Mock {domain.title()}"
+        self.manifest = MagicMock()
+        self.manifest.name = f"Mock {domain} Provider"
+        self.mass = mass or MagicMock()
+        self.dashboards = MagicMock()
+        self.logger = logging.getLogger(f"test.{domain}")
+        self.unloading = False
+        # tests that let their players signal state updates fill this with the
+        # players of this provider, the way a real provider reports them
+        self.players: list[Player] = []
+
+
+class MockPlayer(Player):
+    """Mock player for testing."""
+
+    def __init__(
+        self,
+        provider: MockProvider,
+        player_id: str,
+        name: str,
+        player_type: PlayerType = PlayerType.PLAYER,
+        identifiers: dict[IdentifierType, str] | None = None,
+    ) -> None:
+        """Initialize the mock player."""
+        # Set up the mock config before calling super().__init__
+        # because the parent __init__ accesses config
+        provider.mass.config.get_base_player_config.return_value = create_mock_config(name)
+
+        super().__init__(provider, player_id)  # type: ignore[arg-type]
+        self._attr_name = name
+        # Set type as instance attribute (overrides class attribute)
+        self._attr_type = player_type
+        self._attr_available = True
+        self._attr_powered = True
+        self._attr_supported_features = {PlayerFeature.VOLUME_SET}
+        self._attr_can_group_with = set()
+        self._attr_group_members = []
+
+        # Set up device info with identifiers
+        self._attr_device_info = DeviceInfo(
+            model="Test Model",
+            manufacturer="Test Manufacturer",
+        )
+        if identifiers:
+            for conn_type, value in identifiers.items():
+                self._attr_device_info.add_identifier(conn_type, value)
+
+        # Clear cached properties after modifying attributes
+        self._cache.clear()
+
+    async def set_members(
+        self,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """Mock implementation of set_members."""
+        current_members = set(self._attr_group_members)
+
+        if player_ids_to_add:
+            current_members.update(player_ids_to_add)
+
+        if player_ids_to_remove:
+            current_members.difference_update(player_ids_to_remove)
+
+        # Always include self as first member if there are members
+        if current_members:
+            self._attr_group_members = [self.player_id] + [
+                pid for pid in current_members if pid != self.player_id
+            ]
+        else:
+            self._attr_group_members = []
+
+        # Clear cache to reflect changes
+        self._cache.clear()
+
+    async def stop(self) -> None:
+        """Stop playback - required abstract method."""
+
+
+class MockMass:
+    """Type hint for mocked MusicAssistant instance."""

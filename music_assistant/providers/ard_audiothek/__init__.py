@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from gql import Client
@@ -36,6 +36,8 @@ from music_assistant_models.streamdetails import StreamDetails
 
 from music_assistant.constants import CONF_PASSWORD
 from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.datetime import from_utc_timestamp, future_timestamp, utc
+from music_assistant.helpers.podcast_parsers import rank_episodes_by_date
 from music_assistant.models.music_provider import MusicProvider
 from music_assistant.providers.ard_audiothek.database_queries import (
     get_history_query,
@@ -54,7 +56,7 @@ from music_assistant.providers.ard_audiothek.database_queries import (
 
 if TYPE_CHECKING:
     from aiohttp import ClientSession
-    from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
+    from music_assistant_models.config_entries import ProviderConfig
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -83,7 +85,6 @@ ARD_AUDIOTHEK_GRAPHQL = "https://api.ardaudiothek.de/graphql"
 SUPPORTED_FEATURES = {
     ProviderFeature.BROWSE,
     ProviderFeature.SEARCH,
-    ProviderFeature.LIBRARY_RADIOS,
     ProviderFeature.LIBRARY_PODCASTS,
 }
 
@@ -136,121 +137,56 @@ def _create_aiohttptransport(headers: dict[str, str] | None = None) -> AIOHTTPTr
     return AIOHTTPTransport(url=ARD_AUDIOTHEK_GRAPHQL, headers=headers, ssl=True)
 
 
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    """
-    Return Config entries to setup this provider.
-
-    instance_id: id of an existing provider instance (None if new instance setup).
-    action: [optional] action key called from config entries UI.
-    values: the (intermediate) raw values for config entries sent with the action.
-    """
-    # ruff: noqa: ARG001
-    if values is None:
-        values = {}
-
-    authenticated = True
-    if values.get(CONF_TOKEN_BEARER) is None or values.get(CONF_USERID) is None:
-        authenticated = False
-
-    return (
-        ConfigEntry(
-            key="label_text",
-            type=ConfigEntryType.LABEL,
-            label=f"Successfully signed in as {values.get(CONF_DISPLAY_NAME)} {str(values.get(CONF_EMAIL, '')).replace('@', '(at)')}.",  # noqa: E501
-            hidden=not authenticated,
-        ),
-        ConfigEntry(
-            key=CONF_EMAIL,
-            type=ConfigEntryType.STRING,
-            label="E-Mail",
-            required=False,
-            description="E-Mail address of ARD account.",
-            hidden=authenticated,
-            value=values.get(CONF_EMAIL),
-        ),
-        ConfigEntry(
-            key=CONF_PASSWORD,
-            type=ConfigEntryType.SECURE_STRING,
-            label="Password",
-            required=False,
-            description="Password of ARD account.",
-            hidden=authenticated,
-            value=values.get(CONF_PASSWORD),
-        ),
-        ConfigEntry(
-            key=CONF_MAX_BITRATE,
-            type=ConfigEntryType.INTEGER,
-            label="Maximum bitrate for streams (0 for unlimited)",
-            required=False,
-            description="Maximum bitrate for streams. Use 0 for unlimited",
-            default_value=0,
-            value=values.get(CONF_MAX_BITRATE),
-        ),
-        ConfigEntry(
-            key=CONF_PODCAST_FINISHED,
-            type=ConfigEntryType.INTEGER,
-            label="Percentage required before podcast episode is marked as fully played",
-            required=False,
-            description="This setting defines how much of a podcast must be listened to before an "
-            "episode is marked as fully played",
-            default_value=95,
-            value=values.get(CONF_PODCAST_FINISHED),
-        ),
-        ConfigEntry(
-            key=CONF_TOKEN_BEARER,
-            type=ConfigEntryType.SECURE_STRING,
-            label="token",
-            hidden=True,
-            required=False,
-            value=values.get(CONF_TOKEN_BEARER),
-        ),
-        ConfigEntry(
-            key=CONF_USERID,
-            type=ConfigEntryType.SECURE_STRING,
-            label="uid",
-            hidden=True,
-            required=False,
-            value=values.get(CONF_USERID),
-        ),
-        ConfigEntry(
-            key=CONF_EXPIRY_TIME,
-            type=ConfigEntryType.SECURE_STRING,
-            label="token_expiry",
-            hidden=True,
-            required=False,
-            default_value=0,
-            value=values.get(CONF_EXPIRY_TIME),
-        ),
-        ConfigEntry(
-            key=CONF_DISPLAY_NAME,
-            type=ConfigEntryType.STRING,
-            label="username",
-            hidden=True,
-            required=False,
-            value=values.get(CONF_DISPLAY_NAME),
-        ),
-    )
-
-
 class ARDAudiothek(MusicProvider):
     """ARD Audiothek Music provider."""
 
+    @property
+    def max_concurrent_streams(self) -> None:
+        """Allow unlimited concurrent upstream source streams."""
+        return None
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """
+        Return the configuration (options) entries for the ARD Audiothek provider.
+
+        Credentials and the token/user-id/expiry stash are collected/persisted by the
+        setup flow; the options surface only shows who is signed in plus the tunables.
+        """
+        display_name = str(self.get_setup_value(CONF_DISPLAY_NAME) or "")
+        email = str(self.get_setup_value(CONF_EMAIL) or "")
+        return (
+            ConfigEntry(
+                key="label_text",
+                type=ConfigEntryType.LABEL,
+                translation_params=[display_name, email.replace("@", "(at)")],
+                hidden=not display_name,
+            ),
+            ConfigEntry(
+                key=CONF_MAX_BITRATE,
+                type=ConfigEntryType.INTEGER,
+                required=False,
+                default_value=0,
+            ),
+            ConfigEntry(
+                key=CONF_PODCAST_FINISHED,
+                type=ConfigEntryType.INTEGER,
+                required=False,
+                default_value=95,
+            ),
+        )
+
     async def get_client(self) -> Client:
-        """Wrap the client creation procedure to recreate client.
+        """
+        Wrap the client creation procedure to recreate client.
 
         This happens when the token is expired or user credentials are updated.
         """
-        _email = self.config.get_value(CONF_EMAIL)
-        _password = self.config.get_value(CONF_PASSWORD)
-        self.token = self.config.get_value(CONF_TOKEN_BEARER)
-        self.user_id = self.config.get_value(CONF_USERID)
-        self.token_expire = datetime.fromtimestamp(
-            float(str(self.config.get_value(CONF_EXPIRY_TIME)))
+        _email = self.get_setup_value(CONF_EMAIL)
+        _password = self.get_setup_value(CONF_PASSWORD)
+        self.token = self.get_setup_value(CONF_TOKEN_BEARER)
+        self.user_id = self.get_setup_value(CONF_USERID)
+        self.token_expire = from_utc_timestamp(
+            float(str(self.get_setup_value(CONF_EXPIRY_TIME, 0)))
         )
 
         self.max_bitrate = int(float(str(self.config.get_value(CONF_MAX_BITRATE))))
@@ -258,17 +194,15 @@ class ARDAudiothek(MusicProvider):
         if (
             _email is not None
             and _password is not None
-            and (self.token is None or self.user_id is None or self.token_expire < datetime.now())
+            and (self.token is None or self.user_id is None or self.token_expire < utc())
         ):
             self.token, self.user_id, _display_name = await _login(
                 self.mass.http_session, str(_email), str(_password)
             )
-            self.update_config_value(CONF_TOKEN_BEARER, self.token, encrypted=True)
-            self.update_config_value(CONF_USERID, self.user_id, encrypted=True)
-            self.update_config_value(CONF_DISPLAY_NAME, _display_name)
-            self.update_config_value(
-                CONF_EXPIRY_TIME, str((datetime.now() + timedelta(hours=1)).timestamp())
-            )
+            self._update_setup_data(CONF_TOKEN_BEARER, self.token)
+            self._update_setup_data(CONF_USERID, self.user_id)
+            self._update_setup_data(CONF_DISPLAY_NAME, _display_name)
+            self._update_setup_data(CONF_EXPIRY_TIME, str(future_timestamp(hours=1)))
             self._client_initialized = False
 
         if not self._client_initialized:
@@ -321,12 +255,14 @@ class ARDAudiothek(MusicProvider):
             )
         return False, 0
 
-    async def get_resume_position(self, item_id: str, media_type: MediaType) -> tuple[bool, int]:
+    async def get_resume_position(
+        self, item_id: str, media_type: MediaType
+    ) -> tuple[bool, int, datetime | None]:
         """Return: finished, position_ms."""
         assert media_type == MediaType.PODCAST_EPISODE
         await self._update_progress()
 
-        return self._get_progress(item_id)
+        return *self._get_progress(item_id), None
 
     async def on_played(
         self,
@@ -362,7 +298,8 @@ class ARDAudiothek(MusicProvider):
         media_types: list[MediaType],
         limit: int = 5,
     ) -> SearchResults:
-        """Perform search on musicprovider.
+        """
+        Perform search on musicprovider.
 
         :param search_query: Search query.
         :param media_types: A list of media_types to include.
@@ -427,8 +364,9 @@ class ARDAudiothek(MusicProvider):
             prov_radio_id,
         )
 
-    async def get_library_podcasts(self) -> AsyncGenerator[Podcast, None]:
-        """Retrieve library/subscribed podcasts from the provider.
+    async def get_library_podcasts(self) -> AsyncGenerator[Podcast]:
+        """
+        Retrieve library/subscribed podcasts from the provider.
 
         Minified podcast information is enough.
         """
@@ -443,7 +381,8 @@ class ARDAudiothek(MusicProvider):
             yield await self.get_podcast(show["subscribedProgramSet"]["coreId"])
 
     async def browse(self, path: str) -> Sequence[MediaItemType | ItemMapping | BrowseFolder]:
-        """Browse through the ARD Audiothek.
+        """
+        Browse through the ARD Audiothek.
 
         This supports browsing through Podcasts and Radio stations.
         :param path: The path to browse, (e.g. provider_id://artists).
@@ -481,12 +420,12 @@ class ARDAudiothek(MusicProvider):
             prov_podcast_id,
         )
 
-    async def get_podcast_episodes(
-        self, prov_podcast_id: str
-    ) -> AsyncGenerator[PodcastEpisode, None]:
+    async def get_podcast_episodes(self, prov_podcast_id: str) -> AsyncGenerator[PodcastEpisode]:
         """Get podcast episodes."""
         await self._update_progress()
         depublished_filter = {"isPublished": {"equalTo": True}}
+        show_title = ""
+        episodes: list[dict[str, Any]] = []
         async with await self.get_client() as session:
             show_length_query.variable_values = {
                 "showId": prov_podcast_id,
@@ -494,7 +433,9 @@ class ARDAudiothek(MusicProvider):
             }
             length = await session.execute(show_length_query)
             length = length["show"]["items"]["totalCount"]
-            step_size = 128
+            # ranking by date needs every page in before anything can be yielded, so pull
+            # them in large chunks. A long running archive costs 6 requests here rather than 21
+            step_size = 512
             for offset in range(0, length, step_size):
                 show_query.variable_values = {
                     "showId": prov_podcast_id,
@@ -503,23 +444,26 @@ class ARDAudiothek(MusicProvider):
                     "filter": depublished_filter,
                 }
                 result = (await session.execute(show_query))["show"]
-                for idx, episode in enumerate(result["items"]["nodes"]):
-                    if len(episode["audioList"]) == 0:
-                        continue
-                    if episode["status"] == "DEPUBLISHED":
-                        continue
-                    episode_id = episode["coreId"]
-
-                    progress = self._get_progress(episode_id)
-                    yield _parse_podcast_episode(
-                        self.domain,
-                        self.instance_id,
-                        episode,
-                        episode_id,
-                        result["title"],
-                        offset + idx,
-                        progress,
-                    )
+                show_title = result["title"]
+                episodes += [
+                    episode
+                    for episode in result["items"]["nodes"]
+                    if episode["audioList"] and episode["status"] != "DEPUBLISHED"
+                ]
+        # the API lists the episodes newest first, so every page has to be in before they can
+        # be ranked oldest to newest
+        positions = rank_episodes_by_date([_publish_date(episode) for episode in episodes])
+        for position, episode in zip(positions, episodes, strict=True):
+            episode_id = episode["coreId"]
+            yield _parse_podcast_episode(
+                self.domain,
+                self.instance_id,
+                episode,
+                episode_id,
+                show_title,
+                position,
+                self._get_progress(episode_id),
+            )
 
     @use_cache(3600 * 24)  # cache for 24 hours
     async def get_podcast_episode(self, prov_episode_id: str) -> PodcastEpisode:
@@ -537,7 +481,7 @@ class ARDAudiothek(MusicProvider):
             result,
             result["showId"],
             result["show"]["title"],
-            result["rowId"],
+            0,
             progress,
         )
 
@@ -674,7 +618,7 @@ class ARDAudiothek(MusicProvider):
 
 
 def _parse_social_media(
-    homepage_url: str | None, social_media_accounts: list[dict[str, None | str]]
+    homepage_url: str | None, social_media_accounts: list[dict[str, str | None]]
 ) -> set[MediaItemLink]:
     return_set = set()
     if homepage_url:
@@ -760,13 +704,23 @@ def _parse_radio(
     return radio
 
 
+def _publish_date(episode: dict[str, Any]) -> datetime | None:
+    """Return the publication date of an episode, or None when it has none we can read."""
+    if not (raw := episode.get("publishDate")):
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+
+
 def _parse_podcast_episode(
     domain: str,
     instance_id: str,
     episode: dict[str, Any],
     podcast_id: str,
     podcast_title: str,
-    idx: int,
+    position: int,
     progress: tuple[bool, int],
 ) -> PodcastEpisode:
     podcast_episode = PodcastEpisode(
@@ -787,7 +741,7 @@ def _parse_podcast_episode(
                 provider_instance=instance_id,
             )
         },
-        position=idx,
+        position=position,
         fully_played=progress[0],
         resume_position_ms=progress[1],
     )
